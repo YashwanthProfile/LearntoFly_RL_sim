@@ -1,0 +1,115 @@
+<!--
+    MuJoCo model of a 3‑DOF gimbal (Yaw, Pitch, Roll) with a virtual load cell
+    at the base. The load cell is realized as a dummy body that sits between the
+    world and the gimbal base, and a <force> sensor measures the reaction force.
+    An external force can be applied at the drone mount point via the site
+    "force_app_point" (located on the Gimbal-Arm body).
+-->
+<mujoco model="3DOF_gimbal_sensor">
+    <compiler angle="radian" />
+    <option timestep="0.0002">
+        <flag contact="disable"/>   <!-- No contacts needed – gimbal is kinematic -->
+    </option>
+
+    <!-- Mesh assets (STL files, scaled from mm to m) -->
+    <asset>
+        <mesh name="BaseGrounded-v2" file="meshes/BaseGrounded-v2.stl" scale="0.001 0.001 0.001" />
+        <mesh name="3-DOF-Assm_3-DOF-mount-v1" file="meshes/3-DOF-Assm_3-DOF-mount-v1.stl" scale="0.001 0.001 0.001" />
+        <mesh name="3-DOF-Assm_MR105ZZ-Left-v1" file="meshes/3-DOF-Assm_MR105ZZ-Left-v1.stl" scale="0.001 0.001 0.001" />
+        <mesh name="3-DOF-Assm_MR105ZZ-Right-v1" file="meshes/3-DOF-Assm_MR105ZZ-Right-v1.stl" scale="0.001 0.001 0.001" />
+        <mesh name="3-DOF-Assm_Universal-joint-new-v1" file="meshes/3-DOF-Assm_Universal-joint-new-v1.stl" scale="0.001 0.001 0.001" />
+        <mesh name="Bearing_6x13x5-Front-v1" file="meshes/Bearing_6x13x5-Front-v1.stl" scale="0.001 0.001 0.001" />
+        <mesh name="Bearing_6x13x5-Rear-v1" file="meshes/Bearing_6x13x5-Rear-v1.stl" scale="0.001 0.001 0.001" />
+        <mesh name="Gimbal-Arm-v1-v1" file="meshes/Gimbal-Arm-v1-v1.stl" scale="0.001 0.001 0.001" />
+    </asset>
+
+    <worldbody>
+        <light directional="true" pos="-0.5 0.5 3" dir="0 0 -1" />
+        <geom pos="0 0 0" size="1 1 1" type="plane" rgba="1 0.83 0.61 0.5" />
+
+        <!-- ================================================================== -->
+        <!--  LOAD CELL (virtual) – fixed to world, carries the force sensor    -->
+        <!-- ================================================================== -->
+        <body name="LoadCell" pos="0 0 0" euler="0 0 0">
+            <!-- Negligible mass – only a placeholder for the sensor -->
+            <inertial mass="1e-6" pos="0 0 0" fullinertia="1e-12 1e-12 1e-12 0 0 0"/>
+            <!-- Visual marker (green cube) – shows where the "load cell" sits -->
+            <geom type="box" size="0.015 0.015 0.005" rgba="0 1 0 0.4" pos="0 0 -0.005"/>
+            <!-- Sensor site: force measured between LoadCell and its child BaseGrounded-v2 -->
+            <site name="loadcell_site" pos="0 0 0"/>
+
+            <!-- ============================================================== -->
+            <!--  GIMBAL BASE – now a child of LoadCell                         -->
+            <!--  All original geometry, inertias, and joints remain unchanged  -->
+            <!-- ============================================================== -->
+            <body name="BaseGrounded-v2" pos="2.4424906541754417e-16 0.0075000000000014205 0.34945438841216026" euler="1.5707963267948897 7.2173261700939e-29 1.3183898417421528e-16">
+                <geom name="BaseGrounded-v2_geom" type="mesh" mesh="BaseGrounded-v2" pos="0 0 0" euler="0 0 0" />
+                <inertial mass="0.5412890425677886" pos="2.7139472530109118e-17 -0.16296709116485936 -2.824762402168473e-18" fullinertia="0.006230249003338097 1.959184022512053e-05 0.006230249003338078 -3.6167418340018144e-18 1.1368683776029338e-20 5.543401356030649e-19" />
+
+                <!-- Yaw joint (vertical axis) -->
+                <body name="3-DOF-Assm_3-DOF-mount-v1" pos="3.8603727993965133e-17 0.03336270322350202 7.771561172376097e-18" euler="-1.0319164567664205e-16 1.1333748079717627 -2.48575889947877e-16">
+                    <joint name="BaseGrounded-v2_Yaw" type="hinge" axis="-6.24919056133371e-15 1.0 2.951635943523715e-15" pos="7.849545399172655e-16 -0.3828640916356622 -6.856861170960462e-16" frictionloss="0.001" />
+                    <geom name="3-DOF-Assm_3-DOF-mount-v1_geom" type="mesh" mesh="3-DOF-Assm_3-DOF-mount-v1" pos="0 0 0" euler="0 0 0" />
+                    <inertial mass="0.003366689582273416" pos="-2.829223868435766e-08 -0.01010298460541179 3.722638145691966e-14" fullinertia="3.5228903931151425e-07 2.748685358916995e-07 5.984007306325523e-07 -7.471312144658356e-13 -8.933990013914308e-14 2.113559879480675e-18" />
+
+                    <!-- Pitch joint (tilt forward/back) -->
+                    <body name="3-DOF-Assm_MR105ZZ-Left-v1" pos="-0.01265000000000005 0.00599999999999973 8.937295348232511e-17" euler="2.5786140343457475 1.1772934784804059e-14 9.04745670670045e-16">
+                        <joint name="3-DOF-Assm_3-DOF-mount-v1_Pitch" type="hinge" axis="0.9999999917173279 -9.607569956271433e-08 1.5223367960670586e-07" pos="0.0001501058404655609 8.912837039621211e-08 3.0470901802185756e-08" frictionloss="0.001" range="-1.2 1.2" limited="true"/>
+                        <geom name="3-DOF-Assm_MR105ZZ-Left-v1_geom" type="mesh" mesh="3-DOF-Assm_MR105ZZ-Left-v1" pos="0 0 0" euler="0 0 0" />
+                        <inertial mass="0.0017084291193026145" pos="0.002000000000001382 -1.6122254228539337e-17 -1.9515081942356203e-13" fullinertia="2.6846038592641563e-08 1.5403345271941827e-08 1.5403345963041987e-08 8.652183971802438e-21 -1.3190349928496396e-19 -3.140804785863846e-20" />
+
+                        <!-- Universal joint cross (connects left/right) -->
+                        <body name="3-DOF-Assm_Universal-joint-new-v1" pos="0.012500000000000044 -0.028758271717986547 -0.005999999999999873" euler="-0.0 4.215416757122359e-15 6.387280152258102e-16">
+                            <geom name="3-DOF-Assm_Universal-joint-new-v1_geom" type="mesh" mesh="3-DOF-Assm_Universal-joint-new-v1" pos="0 0 0" euler="0 0 0" />
+                            <inertial mass="0.004237296625070775" pos="2.6170537192873893e-08 0.028758235935645273 0.0059999617465977" fullinertia="3.303180031363493e-07 4.2403325683433097e-07 3.1460866670389953e-07 -6.407071874143977e-13 2.1445543848041226e-12 9.042989680313805e-13" />
+
+                            <!-- Front bearing (fixed, decorative) -->
+                            <body name="Bearing_6x13x5-Front-v1" pos="2.6645352591003756e-17 0.028758271717987612 -0.00550000000000015" euler="1.5707963267949037 -1.7319917619566252e-15 -1.570796326794897">
+                                <geom name="Bearing_6x13x5-Front-v1_geom" type="mesh" mesh="Bearing_6x13x5-Front-v1" pos="0 0 0" euler="0 0 0" />
+                                <inertial mass="0.003089133862750681" pos="-1.0808234734887707e-17 -4.1822714950068715e-18 -1.304783531249349e-13" fullinertia="8.169928025064784e-08 4.614793739187398e-08 4.6147938175783144e-08 -4.368543444458782e-20 -9.456328762706212e-21 2.5326476604530676e-20" />
+                            </body>
+
+                            <!-- Rear bearing – contains the ROLL joint -->
+                            <body name="Bearing_6x13x5-Rear-v1" pos="1.1102230246251566e-17 0.02875827171798676 0.01749999999999982" euler="1.570796326794905 -2.0373030937285337e-15 -1.5707963267948957">
+                                <geom name="Bearing_6x13x5-Rear-v1_geom" type="mesh" mesh="Bearing_6x13x5-Rear-v1" pos="0 0 0" euler="0 0 0" />
+                                <inertial mass="0.003089133862750681" pos="-9.957751931227223e-18 -3.711975285739589e-18 -1.3047888987035045e-13" fullinertia="8.169928025056122e-08 4.614793739172108e-08 4.6147938175751036e-08 -2.6399938617309273e-20 4.3304559428376105e-20 1.3556034521161036e-20" />
+
+                                <!-- Gimbal Arm (carries the payload/drone mount) -->
+                                <body name="Gimbal-Arm-v1-v1" pos="0.04750000000000092 1.099120794378905e-16 -1.4210854715202004e-16" euler="2.958888777136312 -6.217248937901592e-15 -5.564992910933492e-15">
+                                    <!-- ROLL joint – rotates the arm around its own axis -->
+                                    <joint name="Bearing_6x13x5-Rear-v1_Revolute-9" type="hinge" axis="0.9999999504792674 -2.1381670725628688e-08 5.513103560339516e-07" pos="-0.049999827521987145 1.6169777400897034e-07 3.652006659547735e-07" frictionloss="0.001" />
+                                    <geom name="Gimbal-Arm-v1-v1_geom" type="mesh" mesh="Gimbal-Arm-v1-v1" pos="0 0 0" euler="0 0 0" />
+                                    <inertial mass="0.024646180771848526" pos="0.01 -0.0621279369611197 1.1934897514720433e-14" fullinertia="8.139018361643903e-05 0.00038558680607033954 0.00046686383563477045 0.00012882169307650563 4.1870532648674574e-17 -8.019030318245912e-17" />
+
+                                    <!-- ========================================== -->
+                                    <!--  SITE FOR APPLYING EXTERNAL FORCES         -->
+                                    <!--  Position: drone mount point (from CAD)    -->
+                                    <!-- ========================================== -->
+                                    <site name="force_app_point"
+                                          pos="0.21395396626573477 -0.001928636845393814 -0.002094062040201706"
+                                          type="sphere" size="0.005" rgba="1 0 0 0.8"/>
+                                </body>
+                            </body>
+
+                            <!-- Right bearing (fixed, decorative) -->
+                            <body name="3-DOF-Assm_MR105ZZ-Right-v1" pos="0.008499999999999987 0.028758271717986474 0.006000000000000121" euler="-1.5707963267948921 2.7867036353505065e-15 -1.0735790613816575e-15">
+                                <geom name="3-DOF-Assm_MR105ZZ-Right-v1_geom" type="mesh" mesh="3-DOF-Assm_MR105ZZ-Right-v1" pos="0 0 0" euler="0 0 0" />
+                                <inertial mass="0.0017084291193026145" pos="0.002000000000001412 -5.353870409087559e-17 -1.9512474144033355e-13" fullinertia="2.684603859274989e-08 1.5403345272022596e-08 1.540334596305879e-08 5.858604641276554e-21 -1.1214949758868537e-19 7.467124825638691e-20" />
+                            </body>
+                        </body>
+                    </body>
+                </body>
+            </body>
+        </body>
+    </worldbody>
+
+    <!-- Force sensor: measures the reaction force between LoadCell and its child BaseGrounded-v2 -->
+    <sensor>
+        <force name="loadcell_force" site="loadcell_site"/>
+    </sensor>
+
+    <!-- Starting configuration (home) -->
+    <keyframe>
+        <key name="home" qpos="1.5707 1.2 4.903"/>
+    </keyframe>
+</mujoco>
