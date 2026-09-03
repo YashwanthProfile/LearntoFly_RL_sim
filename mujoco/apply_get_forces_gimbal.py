@@ -1,7 +1,8 @@
 """
-Apply a user‑selectable time‑varying force at the drone mount point of a 3‑DOF gimbal,
-and record the resulting load‑cell reaction from MuJoCo's native sensor.
-Manual calculation and plotting are commented out (keep sensor only).
+Apply a user‑selectable time‑varying FORCE and TORQUE at the drone mount point.
+All inputs (Fx, Fy, Fz, Tx, Ty, Tz) are defined in the ARM (local) frame.
+The code rotates them to the world frame before applying them via mj_applyFT.
+Also logs and plots the 3 DOF joint angles (Yaw, Pitch, Roll).
 """
 
 import mujoco
@@ -16,8 +17,8 @@ import sys
 # 0. USER SELECTION: FORCE PROFILE AND PARAMETERS
 # ----------------------------------------------------------------------
 # Choose one of the following profiles:
-#   'constant'    – constant force (Fz_const only)
-#   'ramp'        – linear ramp up to a max force, then hold
+#   'constant'    – constant force and torque
+#   'ramp'        – linear ramp up to max values, then hold
 #   'step'        – step change at a specified time
 #   'sine_decay'  – decaying sine (oscillatory, dies out)
 #   'chirp'       – swept sine (frequency increases over time)
@@ -29,37 +30,61 @@ FORCE_PROFILE = 'impulse'   # change this to select a profile
 # Profile parameters – adjust these to tune each profile
 # ----------------------------------------------------------------------
 # Common parameters (used by multiple profiles)
-Fz_const = 0.0          # constant vertical offset (N) – usually 0 for dynamic tests
-amp_x   = 0.08          # amplitude for horizontal X (N)
-amp_y   = 0.08          # amplitude for horizontal Y (N)
-amp_z   = 0.15          # amplitude for vertical perturbation (N)
-freq    = 0.4           # base frequency (Hz)
-tau     = 2.5           # decay time constant (s) for decaying profiles
+# Fz_const = 0.0          # constant vertical force offset (N) – in ARM frame
+# amp_x   = 0.08          # amplitude for horizontal X force (N)
+# amp_y   = 0.08          # amplitude for horizontal Y force (N)
+# amp_z   = 0.15          # amplitude for vertical Z force (N)
+# freq    = 0.4           # base frequency (Hz)
+# tau     = 2.5           # decay time constant (s) for decaying profiles
+
+Fz_const = 0.0          # constant vertical force offset (N) – in ARM frame
+amp_x   = 0.0          # amplitude for horizontal X force (N)
+amp_y   = 0.0          # amplitude for horizontal Y force (N)
+amp_z   = 0.0          # amplitude for vertical Z force (N)
+freq    = 0.0           # base frequency (Hz)
+tau     = 0.0           # decay time constant (s) for decaying profiles
+
+# Torque amplitudes (in ARM frame) – used by sine_decay, chirp, etc.
+# tor_amp_x = 0.01        # amplitude for torque around X (Nm)
+# tor_amp_y = 0.01        # amplitude for torque around Y (Nm)
+# tor_amp_z = 0.02        # amplitude for torque around Z (Nm)
+
+tor_amp_x = 0.0        # amplitude for torque around X (Nm)
+tor_amp_y = 0.0        # amplitude for torque around Y (Nm)
+tor_amp_z = 0.0        # amplitude for torque around Z (Nm)
+
+# Ramp specific – per‑axis amplitudes (forces and torques)
+ramp_duration = 2.0     # time to reach max value (s)
+ramp_amp_x = 0.0        # final force in X (N)
+ramp_amp_y = 0.0        # final force in Y (N)
+ramp_amp_z = 0.5        # final force in Z (N)
+ramp_tor_x = 0.0        # final torque around X (Nm)
+ramp_tor_y = 0.0        # final torque around Y (Nm)
+ramp_tor_z = 0.0        # final torque around Z (Nm)
+
+# Step specific – per‑axis amplitudes
+step_time = 1.0         # time of step (s)
+step_amp_x = 0.0        # step force in X (N)
+step_amp_y = 0.0        # step force in Y (N)
+step_amp_z = 0.5        # step force in Z (N)
+step_tor_x = 0.0        # step torque around X (Nm)
+step_tor_y = 0.0        # step torque around Y (Nm)
+step_tor_z = 0.0        # step torque around Z (Nm)
+
+# Impulse specific – per‑axis peaks and times
+impulse_times = [1.0, 5.0]          # list of impulse times (s)
+impulse_width = 0.1                 # duration (s) – same for all impulses
+impulse_peak_x = 0.0                # peak force in X (N)
+impulse_peak_y = 1.0               # peak force in Y (N)
+impulse_peak_z = 0.0                # peak force in Z (N)
+impulse_tor_x = 0.0                 # peak torque around X (Nm)
+impulse_tor_y = 0.0                 # peak torque around Y (Nm)
+impulse_tor_z = 0.00                # peak torque around Z (Nm)
 
 # Chirp specific
 freq_start = 0.2        # starting frequency (Hz)
 freq_end   = 1.0        # ending frequency (Hz)
 chirp_duration = 5.0    # duration of chirp (s) – should be <= total simulation time
-
-# Ramp specific – now with per‑axis amplitudes
-ramp_duration = 2.0     # time to reach max force (s)
-ramp_amp_x = 0.0        # final force in X (N)
-ramp_amp_y = 0.0        # final force in Y (N)
-ramp_amp_z = 0.5        # final force in Z (N)
-
-# Step specific – per‑axis amplitudes
-step_time = 1.0         # time of step (s)
-step_amp_x = 0.0        # step change in X (N)
-step_amp_y = 0.0        # step change in Y (N)
-step_amp_z = 0.5        # step change in Z (N)
-
-# Impulse specific – per‑axis peaks and times
-impulse_times = [1.0, 5.0]          # list of impulse times (s)
-impulse_width = 0.1                 # duration (s) – same for all impulses
-impulse_peak_x = 0.0                # peak force in X (N) – applied to all pulses
-impulse_peak_y = 0.1                # peak force in Y (N)
-impulse_peak_z = 0.5                # peak force in Z (N)
-# If you want per‑impulse peaks per axis, you can make them lists as before.
 
 # Drone mimic specific
 thrust_hover = 0.5      # average thrust (N) – constant
@@ -116,119 +141,122 @@ total_mass = np.sum(model.body_mass)
 print(f"Total mass: {total_mass:.6f} kg")
 
 # ----------------------------------------------------------------------
-# 2. FORCE PROFILE GENERATOR
+# 2. WRENCH GENERATOR (Force + Torque in ARM frame)
 # ----------------------------------------------------------------------
-def get_applied_force(t):
+def get_applied_wrench(t):
     """
-    Returns force vector (Fx, Fy, Fz) based on the selected profile.
-    All profiles are designed to be smooth and physically plausible.
+    Returns (force, torque) vectors in the ARM (local) frame.
+    Both are 3‑element numpy arrays.
     """
     if FORCE_PROFILE == 'constant':
-        Fx = 0.0
-        Fy = 0.0
-        Fz = Fz_const  # just a constant
-
+        F = np.array([0.0, 0.0, Fz_const])
+        T = np.array([0.0, 0.0, 0.0])
 
     elif FORCE_PROFILE == 'sine_decay':
-        # Exponentially decaying sine wave
         envelope = np.exp(-t / tau)
         Fx = amp_x * np.sin(2 * np.pi * freq * t) * envelope
         Fy = amp_y * np.cos(2 * np.pi * freq * t) * envelope
         Fz = Fz_const + amp_z * np.sin(2 * np.pi * freq * t * 1.2) * envelope
+        F = np.array([Fx, Fy, Fz])
+
+        # Torques in arm frame (decaying sine)
+        Tx = tor_amp_x * np.sin(2 * np.pi * freq * t * 0.8) * envelope
+        Ty = tor_amp_y * np.cos(2 * np.pi * freq * t * 0.9) * envelope
+        Tz = tor_amp_z * np.sin(2 * np.pi * freq * t * 1.1) * envelope
+        T = np.array([Tx, Ty, Tz])
 
     elif FORCE_PROFILE == 'chirp':
-        # Swept sine: frequency increases linearly from freq_start to freq_end
-        # over chirp_duration, then stays at freq_end (or decays if tau given)
-        # Here we use a simple linear chirp without decay (you can add decay if desired)
         if t < chirp_duration:
             f = freq_start + (freq_end - freq_start) * (t / chirp_duration)
         else:
             f = freq_end
-        # Phase is integral of instantaneous frequency
-        # For linear chirp: phase = 2*pi * (freq_start*t + 0.5*(freq_end-freq_start)*t^2/chirp_duration)
-        # We'll implement it exactly for t < chirp_duration, else continue with constant freq.
         if t < chirp_duration:
             phase = 2 * np.pi * (freq_start * t + 0.5 * (freq_end - freq_start) * t**2 / chirp_duration)
         else:
-            # after chirp, continue with constant frequency (or you can add decay)
             phase = 2 * np.pi * (freq_start * chirp_duration + 0.5 * (freq_end - freq_start) * chirp_duration) + 2 * np.pi * freq_end * (t - chirp_duration)
-        Fx = amp_x * np.sin(phase) * 0.5  # optional envelope
+
+        Fx = amp_x * np.sin(phase) * 0.5
         Fy = amp_y * np.cos(phase * 0.8) * 0.5
         Fz = Fz_const + amp_z * np.sin(phase * 1.2) * 0.5
+        F = np.array([Fx, Fy, Fz])
 
+        Tx = tor_amp_x * np.sin(phase * 0.7) * 0.5
+        Ty = tor_amp_y * np.cos(phase * 0.6) * 0.5
+        Tz = tor_amp_z * np.sin(phase * 0.9) * 0.5
+        T = np.array([Tx, Ty, Tz])
 
     elif FORCE_PROFILE == 'ramp':
         if t < ramp_duration:
             ramp_factor = t / ramp_duration
         else:
             ramp_factor = 1.0
-        Fx = ramp_amp_x * ramp_factor
-        Fy = ramp_amp_y * ramp_factor
-        Fz = Fz_const + ramp_amp_z * ramp_factor   # Fz_const adds a constant offset
+        F = np.array([ramp_amp_x, ramp_amp_y, Fz_const + ramp_amp_z]) * ramp_factor
+        T = np.array([ramp_tor_x, ramp_tor_y, ramp_tor_z]) * ramp_factor
 
     elif FORCE_PROFILE == 'step':
         step_val = 1.0 if t >= step_time else 0.0
-        Fx = step_amp_x * step_val
-        Fy = step_amp_y * step_val
-        Fz = Fz_const + step_amp_z * step_val
+        F = np.array([step_amp_x, step_amp_y, Fz_const + step_amp_z]) * step_val
+        T = np.array([step_tor_x, step_tor_y, step_tor_z]) * step_val
 
     elif FORCE_PROFILE == 'impulse':
-        # Convert scalar width/peak to lists if needed
         if not isinstance(impulse_width, (list, tuple)):
             widths = [impulse_width] * len(impulse_times)
         else:
             widths = impulse_width
-        # For each axis, we can use a scalar peak (applied to all pulses) or a list of peaks.
-        # We'll treat impulse_peak_x, _y, _z as scalars (applied to all pulses).
-        # If you want per‑impulse peaks, you can make them lists as before.
-        pulse_x, pulse_y, pulse_z = 0.0, 0.0, 0.0
+
+        Fx, Fy, Fz = 0.0, 0.0, 0.0
+        Tx, Ty, Tz = 0.0, 0.0, 0.0
         for t0, w in zip(impulse_times, widths):
             if t >= t0 and t <= t0 + w:
                 phase = np.pi * (t - t0) / w
                 sin_val = np.sin(phase)
-                pulse_x += impulse_peak_x * sin_val
-                pulse_y += impulse_peak_y * sin_val
-                pulse_z += impulse_peak_z * sin_val
-        Fx = pulse_x
-        Fy = pulse_y
-        Fz = Fz_const + pulse_z
+                Fx += impulse_peak_x * sin_val
+                Fy += impulse_peak_y * sin_val
+                Fz += impulse_peak_z * sin_val
+                Tx += impulse_tor_x * sin_val
+                Ty += impulse_tor_y * sin_val
+                Tz += impulse_tor_z * sin_val
+        F = np.array([Fx, Fy, Fz_const + Fz])
+        T = np.array([Tx, Ty, Tz])
 
     elif FORCE_PROFILE == 'drone_mimic':
-        # Mimics a drone's thrust: constant hover thrust + small vibrations
-        # plus some lateral disturbances
-        envelope = 1.0  # no decay (or could add a slow drift)
-        Fx = 0.02 * np.sin(2 * np.pi * 0.2 * t)  # small lateral gust
+        # Forces in arm frame
+        Fx = 0.02 * np.sin(2 * np.pi * 0.2 * t)
         Fy = 0.02 * np.cos(2 * np.pi * 0.15 * t)
-        # Vertical: hover thrust + low-frequency oscillation + high-frequency noise
-        Fz = -(thrust_hover) + thrust_noise * np.sin(2 * np.pi * noise_freq * t) + 0.01 * np.sin(2 * np.pi * 5 * t)
-        # Note: we keep Fz negative because thrust is upward (negative in world Z if using our convention)
-        # But for consistency with other profiles, we'll keep Fz positive as upward? Let's define: positive Fz = upward.
-        # So we set Fz = +thrust_hover (since upward is positive Z in MuJoCo world)
-        # But our Fz_const convention: positive is upward.
-        # So we set:
         Fz = thrust_hover + thrust_noise * np.sin(2 * np.pi * noise_freq * t)
+        F = np.array([Fx, Fy, Fz])
+        # Torques in arm frame (small random-like moments)
+        Tx = 0.001 * np.sin(2 * np.pi * 0.1 * t)
+        Ty = 0.001 * np.cos(2 * np.pi * 0.12 * t)
+        Tz = 0.002 * np.sin(2 * np.pi * 0.2 * t)
+        T = np.array([Tx, Ty, Tz])
 
     else:
-        # Default to zero force
-        print(f"WARNING: Unknown profile '{FORCE_PROFILE}'. Applying zero force.")
-        Fx, Fy, Fz = 0.0, 0.0, 0.0
+        print(f"WARNING: Unknown profile '{FORCE_PROFILE}'. Applying zero wrench.")
+        F = np.zeros(3)
+        T = np.zeros(3)
 
-    return np.array([Fx, Fy, Fz])
+    return F, T
 
 # Print current profile information
 print(f"\nSelected force profile: '{FORCE_PROFILE}'")
 if FORCE_PROFILE == 'sine_decay':
-    print(f"  Parameters: amp_x={amp_x}, amp_y={amp_y}, amp_z={amp_z}, freq={freq}, tau={tau}, Fz_const={Fz_const}")
-elif FORCE_PROFILE == 'chirp':
-    print(f"  Parameters: amp_x={amp_x}, amp_y={amp_y}, amp_z={amp_z}, freq_start={freq_start}, freq_end={freq_end}, chirp_duration={chirp_duration}, Fz_const={Fz_const}")
+    print(f"  Force Amps: Fx={amp_x}, Fy={amp_y}, Fz={amp_z}, freq={freq}, tau={tau}, Fz_const={Fz_const}")
+    print(f"  Torque Amps: Tx={tor_amp_x}, Ty={tor_amp_y}, Tz={tor_amp_z}")
 elif FORCE_PROFILE == 'ramp':
-    print(f"  Parameters: ramp_duration={ramp_duration}, ramp_amp_x={ramp_amp_x}, ramp_amp_y={ramp_amp_y}, ramp_amp_z={ramp_amp_z}, Fz_const={Fz_const}")
+    print(f"  Force Amps: Fx={ramp_amp_x}, Fy={ramp_amp_y}, Fz={ramp_amp_z}, duration={ramp_duration}, Fz_const={Fz_const}")
+    print(f"  Torque Amps: Tx={ramp_tor_x}, Ty={ramp_tor_y}, Tz={ramp_tor_z}")
 elif FORCE_PROFILE == 'step':
-    print(f"  Parameters: step_time={step_time}, step_amp_x={step_amp_x}, step_amp_y={step_amp_y}, step_amp_z={step_amp_z}, Fz_const={Fz_const}")
+    print(f"  Force Amps: Fx={step_amp_x}, Fy={step_amp_y}, Fz={step_amp_z}, time={step_time}, Fz_const={Fz_const}")
+    print(f"  Torque Amps: Tx={step_tor_x}, Ty={step_tor_y}, Tz={step_tor_z}")
 elif FORCE_PROFILE == 'impulse':
-    print(f"  Parameters: impulse_times={impulse_times}, impulse_width={impulse_width}, impulse_peak_x={impulse_peak_x}, impulse_peak_y={impulse_peak_y}, impulse_peak_z={impulse_peak_z}, Fz_const={Fz_const}")
+    print(f"  Force Peaks: Fx={impulse_peak_x}, Fy={impulse_peak_y}, Fz={impulse_peak_z}, times={impulse_times}, width={impulse_width}, Fz_const={Fz_const}")
+    print(f"  Torque Peaks: Tx={impulse_tor_x}, Ty={impulse_tor_y}, Tz={impulse_tor_z}")
+elif FORCE_PROFILE == 'chirp':
+    print(f"  Force Amps: Fx={amp_x}, Fy={amp_y}, Fz={amp_z}, freq_start={freq_start}, freq_end={freq_end}, duration={chirp_duration}, Fz_const={Fz_const}")
+    print(f"  Torque Amps: Tx={tor_amp_x}, Ty={tor_amp_y}, Tz={tor_amp_z}")
 elif FORCE_PROFILE == 'drone_mimic':
-    print(f"  Parameters: thrust_hover={thrust_hover}, thrust_noise={thrust_noise}, noise_freq={noise_freq}, Fz_const={Fz_const}")
+    print(f"  thrust_hover={thrust_hover}, thrust_noise={thrust_noise}, noise_freq={noise_freq}")
 else:
     print("  (No specific parameters)")
 
@@ -239,9 +267,11 @@ duration = 9.0                     # total simulation time (s)
 dt = model.opt.timestep
 csv_filename = "gimbal_force_comparison.csv"
 headers = [
-    "Time", "Fx_app", "Fy_app", "Fz_app",
-    "LC_sensor_x", "LC_sensor_y", "LC_sensor_z"
-    # Manual calculation columns removed (commented out)
+    "Time",
+    "Fx_app_arm", "Fy_app_arm", "Fz_app_arm",
+    "Tx_app_arm", "Ty_app_arm", "Tz_app_arm",
+    "LC_sensor_x", "LC_sensor_y", "LC_sensor_z",
+    "Yaw", "Pitch", "Roll"      # Added joint angles
 ]
 
 with open(csv_filename, 'w', newline='') as csvfile:
@@ -253,7 +283,6 @@ with open(csv_filename, 'w', newline='') as csvfile:
 # ----------------------------------------------------------------------
 print("\nStarting simulation. Viewer will open shortly...\n")
 
-
 with mujoco.viewer.launch_passive(model, data) as viewer:
     viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_ACTUATOR] = True
     start_time = data.time
@@ -263,54 +292,59 @@ with mujoco.viewer.launch_passive(model, data) as viewer:
         step_start = time.time()
         t = data.time - start_time
 
-        # ---- 4a. Compute applied force based on selected profile ----
-        force_world = get_applied_force(t)
-        torque_world = np.zeros(3)
+        # ---- 4a. Compute wrench in ARM frame ----
+        F_arm, T_arm = get_applied_wrench(t)
 
-        # ---- 4b. Apply force ----
+        # ---- 4b. Rotate wrench to WORLD frame ----
+        # Get the rotation matrix of the Gimbal-Arm body
+        R = data.xmat[arm_body_id].reshape(3, 3)
+        F_world = R @ F_arm
+        T_world = R @ T_arm
+
+        # Print R every 500 steps for debugging
+        if step_counter % 500 == 0:
+            print(f"\nR matrix at t={t:.2f}s:\n{R}")
+
+        # ---- 4c. Apply wrench to the arm at the site location ----
         data.qfrc_applied[:] = 0.0
         mujoco.mj_applyFT(
             model, data,
-            force_world, torque_world,
-            force_local_pos,
+            F_world, T_world,
+            force_local_pos,      # position in the arm's local frame (site location)
             arm_body_id,
             data.qfrc_applied
         )
 
-        # ---- 4c. Step physics ----
+        # ---- 4d. Step physics ----
         mujoco.mj_step(model, data)
 
-        # ---- 4d. Read MuJoCo sensor ----
+        # ---- 4e. Read MuJoCo sensor ----
         LC_sensor = data.sensordata[sensor_adr:sensor_adr+3].copy()
-
-        # ---- 4e. (Optional) Manual calculation – COMMENTED OUT ----
-        # If you want to re-enable manual calculation, uncomment the lines below.
-        # You will also need to add the corresponding columns to the CSV headers and plot.
-        # manual_Fx, manual_Fy, manual_Fz = ... (compute using momentum)
-        # We'll skip it entirely to keep the code clean.
 
         # ---- 4f. Log data ----
         if step_counter % 10 == 0:
             qpos = data.qpos[:3].copy()
-            row = [data.time] + list(force_world) + list(LC_sensor)
+            row = [data.time] + list(F_arm) + list(T_arm) + list(LC_sensor) + list(qpos)
             with open(csv_filename, 'a', newline='') as csvfile:
                 writer = csv.writer(csvfile)
                 writer.writerow(row)
 
             # Print progress
             if int(t * 2) != int((t - dt*10) * 2):
-                print(f"t={t:.2f}s | Fz_app={force_world[2]:.3f} N | "
+                print(f"t={t:.2f}s | Fz_arm={F_arm[2]:.3f} N, Tz_arm={T_arm[2]:.3f} Nm | "
                       f"LC_sensor=({LC_sensor[0]:.3f}, {LC_sensor[1]:.3f}, {LC_sensor[2]:.3f}) N | "
                       f"Angles (rad): Yaw={qpos[0]:.2f}, Pitch={qpos[1]:.2f}, Roll={qpos[2]:.2f}")
 
         step_counter += 1
 
-        # ---- 4g. Visualize force arrow ----
+        # ---- 4g. Visualize force arrow (in WORLD frame) ----
         world_pos = data.site_xpos[app_site_id]
         viewer.user_scn.ngeom = 0
-        arrow_len = np.linalg.norm(force_world) * 0.2
+
+        # Draw the applied force arrow in the world frame
+        arrow_len = np.linalg.norm(F_world) * 0.2
         if arrow_len > 0.001:
-            dir_vec = force_world / np.linalg.norm(force_world)
+            dir_vec = F_world / np.linalg.norm(F_world)
             z_axis = dir_vec
             x_axis = np.cross(np.array([0, 1, 0]), z_axis)
             if np.linalg.norm(x_axis) < 0.1:
@@ -335,13 +369,10 @@ with mujoco.viewer.launch_passive(model, data) as viewer:
         if time_until_next_step > 0:
             time.sleep(time_until_next_step)
 
-    if step_counter % 100 == 0:   # print every 100 steps to avoid clutter
-        print(f"Raw LC_sensor_z = {LC_sensor[2]:.3f} N")
-
 print(f"\nSimulation complete. Data saved to '{csv_filename}'.")
 
 # ----------------------------------------------------------------------
-# 5. PLOTTING (sensor only – manual plot commented out)
+# 5. PLOTTING (Forces, Torques, Load Cell, and Joint Angles)
 # ----------------------------------------------------------------------
 plt.style.use('seaborn-v0_8-darkgrid')
 plt.rcParams['font.size'] = 12
@@ -349,30 +380,47 @@ plt.rcParams['axes.labelsize'] = 14
 plt.rcParams['legend.fontsize'] = 12
 plt.rcParams['figure.titlesize'] = 16
 
-# Read CSV (only sensor columns now)
-col_names = ['Time', 'Fx_app', 'Fy_app', 'Fz_app', 'LC_sx', 'LC_sy', 'LC_sz']
+# Read CSV
+col_names = ['Time', 'Fx_app', 'Fy_app', 'Fz_app', 'Tx_app', 'Ty_app', 'Tz_app',
+             'LC_sx', 'LC_sy', 'LC_sz', 'Yaw', 'Pitch', 'Roll']
 data_csv = np.genfromtxt(csv_filename, delimiter=',', skip_header=1, names=col_names)
 
 t = data_csv['Time']
 Fx_app, Fy_app, Fz_app = data_csv['Fx_app'], data_csv['Fy_app'], data_csv['Fz_app']
+Tx_app, Ty_app, Tz_app = data_csv['Tx_app'], data_csv['Ty_app'], data_csv['Tz_app']
 LC_sx, LC_sy, LC_sz = data_csv['LC_sx'], data_csv['LC_sy'], data_csv['LC_sz']
+Yaw, Pitch, Roll = data_csv['Yaw'], data_csv['Pitch'], data_csv['Roll']
 
-# Figure 1: Applied force
-fig1, ax1 = plt.subplots(figsize=(10, 5))
-ax1.plot(t, Fx_app, label=r'$F_x$', linewidth=2)
-ax1.plot(t, Fy_app, label=r'$F_y$', linewidth=2)
-ax1.plot(t, Fz_app, label=r'$F_z$', linewidth=2)
+# ---- Figure 1: Applied Force (ARM frame) ----
+fig1, ax1 = plt.subplots(figsize=(10, 4))
+ax1.plot(t, Fx_app, label=r'$F_x$ (arm)', linewidth=2)
+ax1.plot(t, Fy_app, label=r'$F_y$ (arm)', linewidth=2)
+ax1.plot(t, Fz_app, label=r'$F_z$ (arm)', linewidth=2)
 ax1.set_xlabel('Time (s)')
 ax1.set_ylabel('Force (N)')
-ax1.set_title('Applied External Force (Profile: ' + FORCE_PROFILE + ')')
+ax1.set_title('Applied Force (Profile: ' + FORCE_PROFILE + ')')
 ax1.grid(True, alpha=0.4)
 ax1.legend(loc='best')
 fig1.tight_layout()
 fig1.savefig('plot_1_applied_force.png', dpi=200)
 plt.show()
 
-# Figure 2: Load cell sensor (3 subplots)
-fig2, axes = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
+# ---- Figure 2: Applied Torque (ARM frame) ----
+fig2, ax2 = plt.subplots(figsize=(10, 4))
+ax2.plot(t, Tx_app, label=r'$\tau_x$ (arm)', linewidth=2)
+ax2.plot(t, Ty_app, label=r'$\tau_y$ (arm)', linewidth=2)
+ax2.plot(t, Tz_app, label=r'$\tau_z$ (arm)', linewidth=2)
+ax2.set_xlabel('Time (s)')
+ax2.set_ylabel('Torque (Nm)')
+ax2.set_title('Applied Torque (Profile: ' + FORCE_PROFILE + ')')
+ax2.grid(True, alpha=0.4)
+ax2.legend(loc='best')
+fig2.tight_layout()
+fig2.savefig('plot_2_applied_torque.png', dpi=200)
+plt.show()
+
+# ---- Figure 3: Load cell sensor (3 subplots) ----
+fig3, axes = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
 axes[0].plot(t, LC_sx, 'b-', linewidth=2, label='MuJoCo Sensor')
 axes[0].set_ylabel(r'$F_x$ (N)')
 axes[0].grid(True, alpha=0.4)
@@ -389,19 +437,28 @@ axes[2].set_xlabel('Time (s)')
 axes[2].grid(True, alpha=0.4)
 axes[2].legend(loc='best')
 
-fig2.suptitle('Load Cell Reaction Force (MuJoCo Sensor)', fontsize=16)
-fig2.tight_layout(rect=[0, 0, 1, 0.97])
-fig2.savefig('plot_2_loadcell_sensor.png', dpi=200)
+fig3.suptitle('Load Cell Reaction Force (MuJoCo Sensor)', fontsize=16)
+fig3.tight_layout(rect=[0, 0, 1, 0.97])
+fig3.savefig('plot_3_loadcell_sensor.png', dpi=200)
 plt.show()
 
-# Figure 3: Gimbal joint angles (still useful)
-# We need to read Yaw, Pitch, Roll from the CSV – they are not in the current headers.
-# Since we removed them, we can either re-add them or read from data directly.
-# For simplicity, we'll skip joint angle plotting in this version, or we could add them back.
-# Let's add them back to the CSV for completeness.
-# I'll leave it as an exercise – you can easily add qpos to the logging if needed.
+# ---- Figure 4: Gimbal joint angles ----
+fig4, ax4 = plt.subplots(figsize=(10, 4))
+ax4.plot(t, Yaw, label='Yaw', linewidth=2)
+ax4.plot(t, Pitch, label='Pitch', linewidth=2)
+ax4.plot(t, Roll, label='Roll', linewidth=2)
+ax4.set_xlabel('Time (s)')
+ax4.set_ylabel('Joint Angle (rad)')
+ax4.set_title('Gimbal Joint Motion (3 DOF)')
+ax4.grid(True, alpha=0.4)
+ax4.legend(loc='best')
+fig4.tight_layout()
+fig4.savefig('plot_4_joint_angles.png', dpi=200)
+plt.show()
 
 print("\nPlots saved:")
 print("  - plot_1_applied_force.png")
-print("  - plot_2_loadcell_sensor.png")
-print("\n(Manual calculation and plotting are commented out.)")
+print("  - plot_2_applied_torque.png")
+print("  - plot_3_loadcell_sensor.png")
+print("  - plot_4_joint_angles.png")
+print("\n(All forces and torques are defined in the ARM frame.)")
