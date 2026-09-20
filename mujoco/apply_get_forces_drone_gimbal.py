@@ -1,5 +1,13 @@
-# Apply prescribed rpm profile to motors m1–4 and plotting the body moments and forces generated against time.
-# Also plots the time series of Fx,Fy,Fz at the load cell placement location below the mounting bracket, for sanity check.
+"""
+Drive motors m1–m4 with a prescribed RPM profile and plot:
+  1. motor RPMs,
+  2. drone body thrust Fz and moments τx, τy, τz,
+  3. 3-axis load-cell reaction forces.
+
+Actuation is done by applying per-motor thrust as an external force:
+    F_i = k_f * omega_i^2 ,   omega_i = RPM_i * 2*pi/60 ,   RPM_i = u_i * MAX_RPM
+so no <actuator> entries are needed in the XML.
+"""
 
 import mujoco
 import mujoco.viewer
@@ -8,12 +16,66 @@ import numpy as np
 import csv
 import matplotlib.pyplot as plt
 
+# ----------------------------------------------------------------------
+# 0. USER SELECTION
+# ----------------------------------------------------------------------
+MOTOR_PROFILE = 'drone_mimic'      # 'constant' | 'ramp' | 'step' | 'sine_decay'
+                                   # 'chirp' | 'impulse' | 'drone_mimic'
 
-# Load model & reset to keyframe
+# ---- Crazyflie 2.1 datasheet-based constants ----
+MAX_RPM = 25000.0    # rpm at full throttle (u = 1)
+KF      = 1.8e-8     # thrust coefficient [N/(rad/s)^2]
 
-model_path = '3DOF.xml'
+# Hover thrust per motor -> derived hover RPM
+hover_N     = 0.052
+omega_hover = np.sqrt(hover_N / KF)
+rpm_hover   = omega_hover * 60.0 / (2*np.pi)
+u_hover     = rpm_hover / MAX_RPM
+
+# ---- Profile amplitudes, all in "fraction of MAX_RPM" ----
+# Ramp
+ramp_duration = 2.0
+ramp_u_target = 0.20
+# Step
+step_time     = 1.0
+step_u_target = 0.20
+# Sine-decay
+sine_base_u   = 0.10
+sine_base_amp = 0.05
+sine_dpitch   = 0.03
+sine_droll    = 0.03
+sine_dyaw     = 0.01
+sine_freq     = 1.0
+sine_tau      = 1.0
+# Chirp
+chirp_base_u  = 0.10
+chirp_amp     = 0.05
+chirp_dpitch  = 0.03
+chirp_droll   = 0.03
+chirp_dyaw    = 0.01
+freq_start    = 0.2
+freq_end      = 1.0
+chirp_duration = 5.0
+# Impulse
+impulse_times  = [1.0, 5.0]
+impulse_width  = 0.10
+impulse_peak   = 0.10
+impulse_dpitch = 0.03
+impulse_droll  = 0.03
+impulse_dyaw   = 0.02
+# Drone mimic
+thrust_noise  = 0.1
+noise_freq    = 0.30
+mimic_dpitch  = 0.010
+mimic_droll   = 0.010
+mimic_dyaw    = 0.005
+
+# ----------------------------------------------------------------------
+# 1. LOAD MODEL & RESET
+# ----------------------------------------------------------------------
+model_path = '3DOF_drone_gimbal.xml'
 model = mujoco.MjModel.from_xml_path(model_path)
-data = mujoco.MjData(model)
+data  = mujoco.MjData(model)
 
 key_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
 if key_id != -1:
@@ -22,50 +84,115 @@ if key_id != -1:
 else:
     print("Warning: 'home' not found, using default state.")
 
-# ids for base and drone bodies
-base_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "BaseGrounded-v2")
-drone_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "Crazyflie_Combained-Body-v2")
+base_id  = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "BaseGrounded-v2")
+drone_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "Crazyflie_Combined-Body-v2")
+if drone_id == -1:
+    raise RuntimeError("Body 'Crazyflie_Combined-Body-v2' not found.")
 
 motor_names = ["motor1", "motor2", "motor3", "motor4"]
-actuator_ids = {name: mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, name) for name in motor_names}
-site_ids = {name: mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, name) for name in motor_names}
+site_ids    = {n: mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, n) for n in motor_names}
+for n, sid in site_ids.items():
+    if sid == -1:
+        raise RuntimeError(f"Site '{n}' not found in model.")
 
-gear_z = 0.27          # Thrust gear (N per unit control)
-g = 9.81
-total_mass = np.sum(model.body_mass)   # Total mass of the entire gimbal + drone
+# Optional load-cell sensor
+sensor_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SENSOR, "loadcell_force")
+if sensor_id != -1:
+    sensor_adr = model.sensor_adr[sensor_id]
+    use_sensor = True
+    print(f"Load-cell sensor found: addr={sensor_adr}")
+else:
+    use_sensor = False
+    print("No 'loadcell_force' sensor found — reporting analytic load-cell forces.")
 
-# -------------------------------
-# 3. Simulation settings & force profile
-# -------------------------------
+g          = 9.81
+total_mass = np.sum(model.body_mass)
+print(f"Total mass: {total_mass:.4f} kg  (weight = {total_mass*g:.3f} N)")
+print(f"Hover per motor: {hover_N} N -> {rpm_hover:.0f} rpm  (u_hover = {u_hover:.3f})")
+
+# ----------------------------------------------------------------------
+# 2. RPM PROFILE GENERATOR
+# ----------------------------------------------------------------------
+def get_motor_rpms(t):
+    """Return [rpm1, rpm2, rpm3, rpm4] for time t (X-mixer applied)."""
+    base_u, dpitch, droll, dyaw = 0.0, 0.0, 0.0, 0.0
+
+    if MOTOR_PROFILE == 'constant':
+        base_u = u_hover
+
+    elif MOTOR_PROFILE == 'ramp':
+        base_u = ramp_u_target * min(t / ramp_duration, 1.0)
+
+    elif MOTOR_PROFILE == 'step':
+        base_u = step_u_target * (1.0 if t >= step_time else 0.0)
+
+    elif MOTOR_PROFILE == 'sine_decay':
+        env = np.exp(-t / sine_tau)
+        base_u = sine_base_u + sine_base_amp * np.sin(2*np.pi*sine_freq*t) * env
+        dpitch = sine_dpitch * np.sin(2*np.pi*sine_freq*t*1.2) * env
+        droll  = sine_droll  * np.cos(2*np.pi*sine_freq*t*0.9) * env
+        dyaw   = sine_dyaw   * np.sin(2*np.pi*sine_freq*t*0.7) * env
+
+    elif MOTOR_PROFILE == 'chirp':
+        if t < chirp_duration:
+            phase = 2*np.pi*(freq_start*t
+                             + 0.5*(freq_end - freq_start)*t**2/chirp_duration)
+        else:
+            phase = 2*np.pi*(freq_start*chirp_duration
+                             + 0.5*(freq_end - freq_start)*chirp_duration)
+            phase += 2*np.pi*freq_end*(t - chirp_duration)
+        base_u = chirp_base_u + chirp_amp * np.sin(phase)
+        dpitch = chirp_dpitch * np.sin(phase*1.1)
+        droll  = chirp_droll  * np.cos(phase*0.9)
+        dyaw   = chirp_dyaw   * np.sin(phase*0.7)
+
+    elif MOTOR_PROFILE == 'impulse':
+        base_u = u_hover
+        for t0 in impulse_times:
+            if t0 <= t <= t0 + impulse_width:
+                s = np.sin(np.pi * (t - t0) / impulse_width)
+                base_u += impulse_peak   * s
+                dpitch += impulse_dpitch * s
+                droll  += impulse_droll  * s
+                dyaw   += impulse_dyaw   * s
+
+    elif MOTOR_PROFILE == 'drone_mimic':
+        base_u = u_hover + thrust_noise * np.sin(2*np.pi*noise_freq*t)
+        dpitch = mimic_dpitch * np.sin(2*np.pi*0.20*t)
+        droll  = mimic_droll  * np.cos(2*np.pi*0.15*t)
+        dyaw   = mimic_dyaw   * np.sin(2*np.pi*0.10*t)
+
+    else:
+        print(f"WARNING: unknown profile '{MOTOR_PROFILE}'. Using hover.")
+        base_u = u_hover
+
+    u1 = np.clip(base_u + dpitch + droll - dyaw, 0.0, 1.0)
+    u2 = np.clip(base_u - dpitch - droll - dyaw, 0.0, 1.0)
+    u3 = np.clip(base_u + dpitch - droll + dyaw, 0.0, 1.0)
+    u4 = np.clip(base_u - dpitch + droll + dyaw, 0.0, 1.0)
+    return [u1*MAX_RPM, u2*MAX_RPM, u3*MAX_RPM, u4*MAX_RPM]
+
+# ----------------------------------------------------------------------
+# 3. SIMULATION SETTINGS & CSV
+# ----------------------------------------------------------------------
 duration = 10.0
-dt = model.opt.timestep
-
-hover_thrust_N = 0.052
-base_ctrl = hover_thrust_N / gear_z
-perturb_amp_N = 0.015
-
-print(f"Simulation: {duration}s, base thrust = {hover_thrust_N:.3f} N, perturbation = ±{perturb_amp_N:.3f} N")
-print(f"Total mass of system: {total_mass:.4f} kg  (gravity force = {total_mass*g:.3f} N)")
-
-# -------------------------------
-# 4. CSV logging (Only what you asked for)
-# -------------------------------
+dt       = model.opt.timestep
 csv_filename = "loadcell_experiment.csv"
-headers = [
-    "Time",
-    "u1", "u2", "u3", "u4",                     # Motor controls (0-1)
-    "Drone_Fz_body",                            # Thrust along drone body Z
-    "Drone_Taux_body", "Drone_Tauy_body", "Drone_Tauz_body",  # Body moments
-    "Loadcell_Fx", "Loadcell_Fy", "Loadcell_Fz" # 3-axis load cell forces
-]
 
+headers = ["Time",
+           "rpm1", "rpm2", "rpm3", "rpm4",
+           "Drone_Fz_body",
+           "Drone_Taux_body", "Drone_Tauy_body", "Drone_Tauz_body",
+           "Loadcell_Fx", "Loadcell_Fy", "Loadcell_Fz"]
 with open(csv_filename, 'w', newline='') as f:
-    writer = csv.writer(f)
-    writer.writerow(headers)
+    csv.writer(f).writerow(headers)
 
-# -------------------------------
-# 5. Launch viewer & run simulation
-# -------------------------------
+print(f"\nMotor profile: '{MOTOR_PROFILE}'")
+print(f"Simulation: {duration} s, dt = {dt} s\n")
+
+# ----------------------------------------------------------------------
+# 4. RUN SIMULATION
+# ----------------------------------------------------------------------
 with mujoco.viewer.launch_passive(model, data) as viewer:
     viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_ACTUATOR] = True
     start_time = data.time
@@ -75,173 +202,134 @@ with mujoco.viewer.launch_passive(model, data) as viewer:
         step_start = time.time()
         t = data.time - start_time
 
-        # ---- A) Generate control signals ----
-        ramp = min(t / 2.0, 1.0)
-        perturbation = perturb_amp_N / gear_z * np.sin(2 * np.pi * 0.5 * t)
-        ctrl_val = np.clip(ramp * base_ctrl + perturbation, 0, 1)
+        # ---- A) RPM commands and per-motor thrust ----
+        rpm_list = get_motor_rpms(t)
+        omegas   = [rpm * 2*np.pi / 60.0 for rpm in rpm_list]
+        thrusts  = [KF * w*w for w in omegas]
 
-        # Slight imbalance to excite pitch/roll moments
-        u1 = ctrl_val * 1.0
-        u2 = ctrl_val * 1.0
-        u3 = ctrl_val * 0.95
-        u4 = ctrl_val * 1.05
-        u_list = [u1, u2, u3, u4]
+        # ---- B) Aggregate thrust wrench onto drone body ----
+        data.xfrc_applied[:] = 0.0
+        drone_com_world = data.xipos[drone_id]
+        F_body_total = np.zeros(3)
+        M_body_total = np.zeros(3)
+        thrusts_world = []
+        for name, F_mag in zip(motor_names, thrusts):
+            sid = site_ids[name]
+            site_mat = data.site_xmat[sid].reshape(3, 3)
+            # thrust along local -Z of the site
+            F_world = F_mag * (-site_mat[:, 2])
+            r_world = data.site_xpos[sid] - drone_com_world
+            M_world = np.cross(r_world, F_world)
+            F_body_total += F_world
+            M_body_total += M_world
+            thrusts_world.append(F_world)
+        data.xfrc_applied[drone_id, 0:3] = F_body_total
+        data.xfrc_applied[drone_id, 3:6] = M_body_total
 
-        for name, u in zip(motor_names, u_list):
-            data.ctrl[actuator_ids[name]] = u
-
-        # ---- B) Step physics ----
+        # ---- C) Step physics ----
         mujoco.mj_step(model, data)
 
-        # ---- C) Log data every 10 steps ----
+        # ---- D) Log every 10 steps ----
         if step_counter % 10 == 0:
-            # --- 1. Drone body-axis thrust (Fz) and moments (Taux, Tauy, Tauz) ---
-            thrusts = [u * gear_z for u in u_list]
-            total_thrust = sum(thrusts)
-            Drone_Fz_body = -total_thrust   # Positive = upward thrust
+            # Drone body Fz and moments (analytic, in drone body frame)
+            total_thrust  = sum(thrusts)
+            Drone_Fz_body = -total_thrust         # upward = positive
 
-            # Compute moments about drone COM using motor positions
-            drone_pos = data.xpos[drone_id]
             drone_mat = data.xmat[drone_id].reshape(3, 3)
-            Taux, Tauy, Tauz = 0.0, 0.0, 0.0
+            Taux = Tauy = Tauz = 0.0
             for name, F in zip(motor_names, thrusts):
-                site_id = site_ids[name]
-                world_pos = data.site_xpos[site_id]
-                local_pos = drone_mat.T @ (world_pos - drone_pos)  # position in body frame
-                # Force vector in body frame is [0, 0, -F]
+                local_pos = drone_mat.T @ (data.site_xpos[site_ids[name]]
+                                           - data.xipos[drone_id])
                 Taux += local_pos[1] * (-F)
-                Tauy += -local_pos[0] * (-F)   # r_x * F_z
-                # Tauz from the yaw gear (0.002) is neglected here for clarity
+                Tauy += -local_pos[0] * (-F)
             Drone_Taux_body, Drone_Tauy_body, Drone_Tauz_body = Taux, Tauy, Tauz
 
-            # --- 2. 3-Axis Load Cell Readings (Fx, Fy, Fz) at the base ---
-            # Total gravity force on the entire system (world frame)
-            gravity_vec = np.array([0, 0, -total_mass * g])
+            # Load-cell reaction
+            if use_sensor:
+                LC = data.sensordata[sensor_adr:sensor_adr+3].copy()
+                Loadcell_Fx, Loadcell_Fy, Loadcell_Fz = LC
+            else:
+                gravity_vec = np.array([0.0, 0.0, -total_mass*g])
+                thrust_vec  = np.sum(thrusts_world, axis=0)
+                Loadcell_Fx, Loadcell_Fy, Loadcell_Fz = -(gravity_vec + thrust_vec)
 
-            # Total thrust vector from all motors (world frame)
-            total_thrust_vec = np.zeros(3)
-            for name, u in zip(motor_names, u_list):
-                site_id = site_ids[name]
-                F_mag = u * gear_z
-                site_mat = data.site_xmat[site_id].reshape(3, 3)
-                # Thrust acts along local -Z of the site
-                force_world = -F_mag * site_mat[:, 2]
-                total_thrust_vec += force_world
-
-            # Net external force on the system = Gravity + Thrust
-            net_force = gravity_vec + total_thrust_vec
-
-            # The load cell measures the REACTION force (opposite of net external force)
-            Loadcell_Fx, Loadcell_Fy, Loadcell_Fz = -net_force
-
-            # ---- Write to CSV ----
-            row = [data.time] + u_list + [
-                Drone_Fz_body, Drone_Taux_body, Drone_Tauy_body, Drone_Tauz_body,
-                Loadcell_Fx, Loadcell_Fy, Loadcell_Fz
-            ]
+            row = [data.time] + rpm_list + [
+                Drone_Fz_body,
+                Drone_Taux_body, Drone_Tauy_body, Drone_Tauz_body,
+                Loadcell_Fx, Loadcell_Fy, Loadcell_Fz]
             with open(csv_filename, 'a', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(row)
+                csv.writer(f).writerow(row)
 
-            # Print status every 0.5s
-            if int(t * 2) != int((t - dt*10) * 2):
-                print(f"t={t:.2f}s | u1={u1:.3f} | Fz_drone={Drone_Fz_body:.4f}N | Loadcell_Fz={Loadcell_Fz:.4f}N")
+            if int(t*2) != int((t - dt*10)*2):
+                print(f"t={t:5.2f}s | rpm=[{rpm_list[0]:5.0f},{rpm_list[1]:5.0f},"
+                      f"{rpm_list[2]:5.0f},{rpm_list[3]:5.0f}] "
+                      f"| Fz_drone={Drone_Fz_body:+.4f} N "
+                      f"| LC_Fz={Loadcell_Fz:+.4f} N")
 
         step_counter += 1
 
-        # ---- D) Visualize thrust arrows ----
+        # ---- E) Thrust arrows ----
         viewer.user_scn.ngeom = 0
-        scale_factor = 0.2
-        for name in motor_names:
-            site_id = site_ids[name]
-            pos = data.site_xpos[site_id]
-            site_mat = data.site_xmat[site_id].reshape(3, 3)
-            thrust = data.ctrl[actuator_ids[name]] * gear_z
-            arrow_len = max(thrust * scale_factor, 0.001)
-            # Rotate matrix so arrow points along local -Z (thrust direction)
-            mat_rot = site_mat @ np.diag([1, -1, -1])
+        for name, F_mag in zip(motor_names, thrusts):
+            sid      = site_ids[name]
+            pos      = data.site_xpos[sid]
+            site_mat = data.site_xmat[sid].reshape(3, 3)
+            arrow_len = max(F_mag * 0.5, 0.001)
+            mat_rot   = site_mat @ np.diag([1, -1, -1])
             mujoco.mjv_initGeom(
                 viewer.user_scn.geoms[viewer.user_scn.ngeom],
                 type=mujoco.mjtGeom.mjGEOM_ARROW,
                 size=np.array([0.003, 0.003, arrow_len]),
-                pos=pos,
-                mat=mat_rot.flatten(),
-                rgba=np.array([1.0, 0.1, 0.0, 0.9])
-            )
+                pos=pos, mat=mat_rot.flatten(),
+                rgba=np.array([1.0, 0.1, 0.0, 0.9]))
             viewer.user_scn.ngeom += 1
 
         viewer.sync()
-        time_until_next_step = dt - (time.time() - step_start)
-        if time_until_next_step > 0:
-            time.sleep(time_until_next_step)
+        time_until = dt - (time.time() - step_start)
+        if time_until > 0:
+            time.sleep(time_until)
 
 print(f"\nSimulation complete. Data saved to '{csv_filename}'.")
 
-# -------------------------------
-# 6. Generate the 3 required plots
-# -------------------------------
-col_names = [
-    'Time', 'u1', 'u2', 'u3', 'u4',
-    'Drone_Fz_body', 'Drone_Taux_body', 'Drone_Tauy_body', 'Drone_Tauz_body',
-    'Loadcell_Fx', 'Loadcell_Fy', 'Loadcell_Fz'
-]
-data_csv = np.genfromtxt(csv_filename, delimiter=',', skip_header=1, names=col_names)
+# ----------------------------------------------------------------------
+# 5. PLOTS
+# ----------------------------------------------------------------------
+col_names = ['Time', 'rpm1', 'rpm2', 'rpm3', 'rpm4',
+             'Drone_Fz_body', 'Drone_Taux_body', 'Drone_Tauy_body', 'Drone_Tauz_body',
+             'Loadcell_Fx', 'Loadcell_Fy', 'Loadcell_Fz']
+d = np.genfromtxt(csv_filename, delimiter=',', skip_header=1, names=col_names)
+t = d['Time']
 
-t = data_csv['Time']
-u1, u2, u3, u4 = data_csv['u1'], data_csv['u2'], data_csv['u3'], data_csv['u4']
-Fz_drone = data_csv['Drone_Fz_body']
-Taux_drone, Tauy_drone, Tauz_drone = data_csv['Drone_Taux_body'], data_csv['Drone_Tauy_body'], data_csv['Drone_Tauz_body']
-Fx_lc, Fy_lc, Fz_lc = data_csv['Loadcell_Fx'], data_csv['Loadcell_Fy'], data_csv['Loadcell_Fz']
-
-# --- Plot 1: Control inputs (0-100%) ---
+# Plot 1: Motor RPMs
 plt.figure(figsize=(10, 4))
-plt.plot(t, u1*100, label='Motor 1', lw=1.5)
-plt.plot(t, u2*100, label='Motor 2', lw=1.5)
-plt.plot(t, u3*100, label='Motor 3', lw=1.5)
-plt.plot(t, u4*100, label='Motor 4', lw=1.5)
-plt.xlabel('Time (s)')
-plt.ylabel('Control input (%)')
-plt.title('1. Motor Control Signals (u1 - u4)')
-plt.grid(True, alpha=0.3)
-plt.legend()
-plt.tight_layout()
-plt.savefig('plot_1_controls.png', dpi=150)
-plt.show()
+for i in range(4):
+    plt.plot(t, d[f'rpm{i+1}'], label=f'Motor {i+1}', lw=1.5)
+plt.xlabel('Time (s)'); plt.ylabel('RPM')
+plt.title(f'1. Motor RPM (profile: {MOTOR_PROFILE})')
+plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout()
+plt.savefig('plot_1_rpm.png', dpi=150); plt.show()
 
-# --- Plot 2: Drone Body Fz and Moments (τx, τy, τz) ---
-fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
-axes[0].plot(t, Fz_drone, 'r-', lw=1.5)
-axes[0].set_ylabel('Thrust Fz (N)')
-axes[0].set_title('2a. Drone Body Thrust')
-axes[0].grid(True, alpha=0.3)
+# Plot 2: Drone body thrust and moments
+fig, ax = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+ax[0].plot(t, d['Drone_Fz_body'], 'r-', lw=1.5)
+ax[0].set_ylabel('Thrust Fz (N)'); ax[0].set_title('2a. Drone Body Thrust')
+ax[0].grid(True, alpha=0.3)
+ax[1].plot(t, d['Drone_Taux_body'], label='τx (roll)',  lw=1.2)
+ax[1].plot(t, d['Drone_Tauy_body'], label='τy (pitch)', lw=1.2)
+ax[1].plot(t, d['Drone_Tauz_body'], label='τz (yaw)',   lw=1.2)
+ax[1].set_xlabel('Time (s)'); ax[1].set_ylabel('Moment (Nm)')
+ax[1].set_title('2b. Drone Body Moments')
+ax[1].grid(True, alpha=0.3); ax[1].legend()
+plt.tight_layout(); plt.savefig('plot_2_drone_Fz_tau.png', dpi=150); plt.show()
 
-axes[1].plot(t, Taux_drone, label='τx (roll)', lw=1.2)
-axes[1].plot(t, Tauy_drone, label='τy (pitch)', lw=1.2)
-axes[1].plot(t, Tauz_drone, label='τz (yaw)', lw=1.2)
-axes[1].set_xlabel('Time (s)')
-axes[1].set_ylabel('Moment (Nm)')
-axes[1].set_title('2b. Drone Body Moments')
-axes[1].grid(True, alpha=0.3)
-axes[1].legend()
-plt.tight_layout()
-plt.savefig('plot_2_drone_Fz_tau.png', dpi=150)
-plt.show()
-
-# --- Plot 3: 3-Axis Load Cell Forces (Fx, Fy, Fz) ---
+# Plot 3: Load-cell reaction forces
 plt.figure(figsize=(10, 4))
-plt.plot(t, Fx_lc, label='Fx', lw=1.5)
-plt.plot(t, Fy_lc, label='Fy', lw=1.5)
-plt.plot(t, Fz_lc, label='Fz', lw=1.5)
-plt.xlabel('Time (s)')
-plt.ylabel('Force (N)')
+plt.plot(t, d['Loadcell_Fx'], label='Fx', lw=1.5)
+plt.plot(t, d['Loadcell_Fy'], label='Fy', lw=1.5)
+plt.plot(t, d['Loadcell_Fz'], label='Fz', lw=1.5)
+plt.xlabel('Time (s)'); plt.ylabel('Force (N)')
 plt.title('3. Load Cell Readings (3-axis, World Frame)')
-plt.grid(True, alpha=0.3)
-plt.legend()
-plt.tight_layout()
-plt.savefig('plot_3_loadcell_Fxyz.png', dpi=150)
-plt.show()
+plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout()
+plt.savefig('plot_3_loadcell_Fxyz.png', dpi=150); plt.show()
 
-print("\nAll plots saved:")
-print("  - plot_1_controls.png")
-print("  - plot_2_drone_Fz_tau.png")
-print("  - plot_3_loadcell_Fxyz.png")
+print("\nPlots saved: plot_1_rpm.png, plot_2_drone_Fz_tau.png, plot_3_loadcell_Fxyz.png")

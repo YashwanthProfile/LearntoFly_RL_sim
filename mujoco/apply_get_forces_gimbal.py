@@ -153,17 +153,22 @@ def get_applied_wrench(t):
             T = np.array([Tx_const, Ty_const, Tz_const])
 
     elif FORCE_PROFILE == 'sine_decay':
-        envelope = np.exp(-t * tau)
-        Fx = amp_x * np.sin(2 * np.pi * freq * t) * envelope
-        Fy = amp_y * np.cos(2 * np.pi * freq * t) * envelope
-        Fz = Fz_const + amp_z * np.sin(2 * np.pi * freq * t * 1.2) * envelope
-        F = np.array([Fx, Fy, Fz])
+        if t> 3.0:
+            envelope = np.exp(-t * tau)
+            Fx = 0*amp_x * np.sin(2 * np.pi * freq * t) * envelope
+            Fy = amp_y * np.cos(2 * np.pi * freq * t) * envelope
+            Fz = 0*Fz_const + 0*amp_z * np.sin(2 * np.pi * freq * t * 1.2) * envelope
+            F = np.array([Fx, Fy, Fz])
 
-        # Torques in arm frame (decaying sine)
-        Tx = tor_amp_x * np.sin(2 * np.pi * freq * t * 0.8) * envelope
-        Ty = tor_amp_y * np.cos(2 * np.pi * freq * t * 0.9) * envelope
-        Tz = tor_amp_z * np.sin(2 * np.pi * freq * t * 1.1) * envelope
-        T = np.array([Tx, Ty, Tz])
+            # Torques in arm frame (decaying sine)
+            Tx = 0*tor_amp_x * np.sin(2 * np.pi * freq * t * 0.8) * envelope
+            Ty = 0*tor_amp_y * np.cos(2 * np.pi * freq * t * 0.9) * envelope
+            Tz = 0*tor_amp_z * np.sin(2 * np.pi * freq * t * 1.1) * envelope
+            T = np.array([Tx, Ty, Tz])
+
+        else:
+            F = 0*np.array([Fx_const, Fy_const, Fz_const])
+            T = 0*np.array([Tx_const, Ty_const, Tz_const])
 
     elif FORCE_PROFILE == 'chirp':
         if t < chirp_duration:
@@ -318,7 +323,18 @@ with mujoco.viewer.launch_passive(model, data) as viewer:
             arm_body_id,
             data.qfrc_applied
         )
+#-----------------------------------------------------------------------------------------------------------
+        # Get joint IDs
+        pitch_joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "3-DOF-Assm_3-DOF-mount-v1_Pitch")
+        roll_joint_id  = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "Bearing_6x13x5-Rear-v1_Revolute-9")
 
+        # Set both joints as limited with zero range
+        model.jnt_range[pitch_joint_id] = [0.0, 0.0]
+        model.jnt_limited[pitch_joint_id] = True
+
+        model.jnt_range[roll_joint_id] = [0.0, 0.0]
+        model.jnt_limited[roll_joint_id] = True
+#-----------------------------------------------------------------------------------------------------------
         # ---- 4d. Step physics ----
         mujoco.mj_step(model, data)
 
