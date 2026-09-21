@@ -15,3 +15,11 @@ To do:
 4. Exact same updations to gimbal+drone setup code to map control input to forces at the load cell
 
 5. Cross validation by pre-multiplying F_{sensor} with the \mathcal{C}_{AN} transformation matrix, to get F_{applied}
+
+
+Classification of XML file:
+
+Bearing 6,7, 10, 11 and Universal Joint
+Load cell and load cell stand, holder v with shorter foot
+Bearing 8, 9 and Yaw support, uj holder 4, 5
+Carbon fiber rod, Counter weights, Drone holder, drone, imu holder
