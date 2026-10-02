@@ -1,0 +1,116 @@
+<!--
+    3-DOF gimbal (Yaw, Pitch, Roll) with load cell sensor and 4 thrust actuators.
+    All STLs exported in MJ_CS with "Do not translate to positive space" ticked.
+
+    Grouping:
+      Base          = Load cell + load cell stand + holder v with shorter foot
+      Yaw           = Bearings 8, 9 + Yaw support + uj holder 4, 5
+      Pitch         = Bearings 6, 7, 10, 11 + Universal Joint
+      Roll + Drone  = Carbon rod + counter weights + drone holder + drone + imu holder
+
+    CHANGES vs previous version
+      * pitch_joint / roll_joint now have angle limits (radians) so the arm / drone
+        cannot swing into the strut mount below.  TUNE these from the CAD:
+          pitch  +-0.5236 rad = +-30 deg   (arm up/down, the one that hits the strut)
+          roll   +-1.0472 rad = +-60 deg   (drone rotating about the carbon rod)
+        yaw is left free (add range="-3.14 3.14" if cables / stand limit it).
+      * viscous joint damping so the (very low-inertia) roll axis cannot spin up.
+        Roll inertia about the rod is only ~4.5e-5 kg m^2, so a few mN*m already
+        gives tens of rad/s^2 without damping.
+      * motor actuators: gear flipped to +z (thrust UP in the site frame), matching
+        THRUST_DIR_LOCAL in the Python script.  They are not used by the script
+        (ctrl stays 0); thrust is applied through xfrc_applied.
+-->
+<mujoco model="3DOF_gimbal_drone">
+  <compiler angle="radian" meshdir="updated_meshes"/>
+  <option timestep="0.0002">
+    <flag contact="disable"/>
+  </option>
+
+  <asset>
+    <mesh name="base"  file="Loadcell_and_Stand_Foot.STL"             scale="0.001 0.001 0.001"/>
+    <mesh name="yaw"   file="BallBearings_YawSupport_UJholder.STL"    scale="0.001 0.001 0.001"/>
+    <mesh name="pitch" file="BallBearings_UniJoint.STL"               scale="0.001 0.001 0.001"/>
+    <mesh name="roll"  file="CarbonRod_Counter_Holder_IMU_Drone.STL"  scale="0.001 0.001 0.001"/>
+  </asset>
+
+  <worldbody>
+    <light directional="true" pos="0 0 2" dir="0 0 -1"/>
+    <geom type="plane" size="2 2 1" rgba="1 0.83 0.61 0.5"/>
+
+    <body name="LoadCell" pos="0 0 0" euler="0 0 0">
+      <inertial mass="1e-6" pos="0 0 0" fullinertia="1e-9 1e-9 1e-9 0 0 0"/>
+      <site name="loadcell_site" pos="0 0 0"/>
+
+      <!-- ============= BASE (fixed to world, 0.609 kg) ============= -->
+      <body name="Base" pos="0 0 0" euler="0 0 0">
+        <inertial mass="0.60870"
+                  pos="0.00048 0 0.20269"
+                  fullinertia="1.13674e-2 1.13675e-2 1.79870e-4 0 2.6671e-5 0"/>
+        <geom type="mesh" mesh="base"/>
+
+        <!-- ============= YAW (vertical hinge, 0.0064 kg) ============= -->
+        <body name="Yaw" pos="0 0 0" euler="0 0 0">
+          <joint name="yaw_joint" type="hinge"
+                 axis="0 0 1"
+                 pos="0 0 0.35"
+                 damping="0.005"
+                 frictionloss="0.001"/>
+          <inertial mass="0.00640"
+                    pos="0.00118 0 0.49509"
+                    fullinertia="3.88007e-6 2.94238e-6 1.10815e-6 8.49e-9 6.61e-9 -2e-11"/>
+          <geom type="mesh" mesh="yaw"/>
+
+          <!-- ============= PITCH (horizontal hinge, 0.0082 kg) ============= -->
+          <body name="Pitch" pos="0 0 0" euler="0 0 0">
+            <joint name="pitch_joint" type="hinge"
+                   axis="0 1 0"
+                   pos="0 0 0.5165"
+                   limited="true" range="-0.5236 0.5236"
+                   damping="0.02"
+                   frictionloss="0.001"/>
+            <inertial mass="0.00821"
+                      pos="0.00123 0 0.51650"
+                      fullinertia="6.7246e-7 6.6663e-7 9.5838e-7 5e-11 -1.58e-9 1e-11"/>
+            <geom type="mesh" mesh="pitch"/>
+
+            <!-- ============= ROLL + DRONE (0.079 kg) ============= -->
+            <body name="Roll" pos="0 0 0" euler="0 0 0">
+              <joint name="roll_joint" type="hinge"
+                     axis="1 0 0"
+                     pos="0 0 0.5165"
+                     limited="true" range="-1.0472 1.0472"
+                     damping="0.004"
+                     frictionloss="0.001"/>
+              <inertial mass="0.07905"
+                        pos="-0.09961 0.00091 0.51647"
+                        fullinertia="4.457e-5 8.4295e-3 8.4704e-3 -7.5814e-5 -4.849e-6 -5.670e-7"/>
+              <geom type="mesh" mesh="roll"/>
+
+              <!-- MOTOR SITES — measured in MJ_CS. All four at same Z. -->
+              <site name="motor1" pos="-0.31143 -0.06496 0.52298" size="0.003" rgba="1 0 0 0.8"/>
+              <site name="motor2" pos="-0.39079  0.07272 0.52298" size="0.003" rgba="1 0 0 0.8"/>
+              <site name="motor3" pos="-0.31021  0.07077 0.52298" size="0.003" rgba="1 0 0 0.8"/>
+              <site name="motor4" pos="-0.39296 -0.06445 0.52298" size="0.003" rgba="1 0 0 0.8"/>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <sensor>
+    <force name="loadcell_force" site="loadcell_site"/>
+  </sensor>
+
+  <actuator>
+    <motor name="motor1" site="motor1" gear="0 0 1 0 0 0" ctrlrange="0 0.3"/>
+    <motor name="motor2" site="motor2" gear="0 0 1 0 0 0" ctrlrange="0 0.3"/>
+    <motor name="motor3" site="motor3" gear="0 0 1 0 0 0" ctrlrange="0 0.3"/>
+    <motor name="motor4" site="motor4" gear="0 0 1 0 0 0" ctrlrange="0 0.3"/>
+  </actuator>
+
+  <keyframe>
+    <key name="home" qpos="0 0 0"/>
+  </keyframe>
+</mujoco>
