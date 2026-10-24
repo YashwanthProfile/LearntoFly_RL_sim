@@ -8,6 +8,7 @@ Usage:
 """
 
 import argparse
+import pickle
 import time
 from pathlib import Path
 
@@ -44,6 +45,21 @@ if not model_path.exists():
 
 print(f"Loading model: {model_path}")
 model = PPO.load(str(model_path))
+
+# Observation normalisation stats saved by train.py (VecNormalize)
+if model_path.parent.name == "best":
+    vecnorm_path = model_path.parent / "vecnormalize.pkl"
+else:
+    vecnorm_path = model_path.with_name(model_path.stem + "_vecnormalize.pkl")
+if not vecnorm_path.exists():
+    # checkpoints: ppo_drone_100000_steps.zip → ppo_drone_vecnormalize_100000_steps.pkl
+    vecnorm_path = model_path.with_name(model_path.stem.replace("ppo_drone_", "ppo_drone_vecnormalize_") + ".pkl")
+if not vecnorm_path.exists():
+    raise FileNotFoundError(f"VecNormalize stats not found for {model_path} (looked for {vecnorm_path})")
+print(f"Loading obs normalisation: {vecnorm_path}")
+with open(vecnorm_path, "rb") as f:
+    vecnorm = pickle.load(f)
+vecnorm.training = False
 
 # ------------------------------------------------------------------ #
 #  Separate env for rollout (we need direct access to mjData)         #
@@ -95,7 +111,7 @@ with mujoco.viewer.launch_passive(env.model, env.data) as viewer:
             step_start = time.time()
 
             # Policy inference (deterministic)
-            action, _ = model.predict(obs, deterministic=True)
+            action, _ = model.predict(vecnorm.normalize_obs(obs), deterministic=True)
             obs, reward, terminated, truncated, info = env.step(action)
             total_reward += reward
             step += 1
@@ -117,21 +133,23 @@ with mujoco.viewer.launch_passive(env.model, env.data) as viewer:
             viewer.user_scn.ngeom = 1
 
             # Print state at ~5 Hz
-            if step % 2 == 0:
+            if step % 5 == 0:
                 yaw   = info["yaw"]
                 pitch = info["pitch"]
                 err_y = DroneEnv._angle_wrap(yaw - tgt_yaw)
                 err_p = pitch - tgt_pitch
+                rpm   = info["rpm"]
                 print(
                     f"   t={step * env.control_dt:5.1f}s | "
                     f"yaw={yaw:.3f} ({np.rad2deg(yaw):6.1f}°)  "
                     f"pitch={pitch:.3f} ({np.rad2deg(pitch):5.1f}°)  "
                     f"err=[{np.rad2deg(err_y):+.1f}°, {np.rad2deg(err_p):+.1f}°]  "
-                    f"r={reward:.3f}",
-                    end="\r",
+                    f"RPM=[{rpm[0]:6.0f} {rpm[1]:6.0f} {rpm[2]:6.0f} {rpm[3]:6.0f}]  "
+                    f"τz={info['tau_yaw']:+.1e}  "
+                    f"r={reward:.3f}"
                 )
 
-            # Pace to real-time (0.1 s per control step)
+            # Pace to real-time (control_dt per control step)
             elapsed = time.time() - step_start
             sleep_t = env.control_dt - elapsed
             if sleep_t > 0:

@@ -8,10 +8,10 @@ from gymnasium import spaces
 class DroneEnv(gym.Env):
     """
     5DOF Drone-on-Gimbal RL Environment.
-    Observation  : 8D  [yaw, pitch, yaw_vel, pitch_vel, tgt_yaw, tgt_pitch, err_yaw, err_pitch]
-    Action       : 4D  [motor1, motor2, motor3, motor4]  each in [0, 1]
-    Control rate : 10 Hz  (0.1 s per step)
-    Episode      : 200 steps = 20 s
+    Observation  : 8D  [err_yaw/π, err_pitch, pitch, tgt_pitch, yaw_vel/5, pitch_vel/5, rev9_off, rev9_vel/5]
+    Action       : 4D  [motor1, motor2, motor3, motor4]  each in [-1, 1]  → RPM [8700, 15600]
+    Control rate : 25 Hz  (0.04 s per step)
+    Episode      : 500 steps = 20 s
     """
 
     metadata = {"render_modes": []}
@@ -62,16 +62,16 @@ class DroneEnv(gym.Env):
         self.rev9_qvel_adr  = self.model.jnt_dofadr[rev9_jnt]
 
         # --- Timing ---
-        self.control_dt           = 0.1                    # 10 Hz
+        self.control_dt           = 0.04                   # 25 Hz
         self.sim_steps_per_control = int(
             round(self.control_dt / self.model.opt.timestep)
-        )                                                  # 0.1 / 0.0002 = 500
-        self.max_episode_steps    = 200                    # 20 s
+        )                                                  # 0.04 / 0.0002 = 200
+        self.max_episode_steps    = 500                    # 20 s
 
         # --- Spaces ---
         # Action: 4 motors, each ctrl ∈ [0, 1]
         self.action_space = spaces.Box(
-            low=0.0, high=1.0, shape=(4,), dtype=np.float32
+            low=-1.0, high=1.0, shape=(4,), dtype=np.float32
         )
 
         # Observation: 8D, unbounded
@@ -84,10 +84,25 @@ class DroneEnv(gym.Env):
         self.target_pitch = 0.0
         self.steps        = 0
 
-        # --- Thrust ctrl range (from apply_forces.py) ---
-        # min_thrust = 0.0500 N, max_thrust = 0.0545 N, gear_z = 0.27
-        self.min_ctrl = 0.0500 / 0.27   # ≈ 0.1852
-        self.max_ctrl = 0.0545 / 0.27   # ≈ 0.2019
+        # --- Motor model: action → RPM → thrust ---
+        #   F_i  = k * RPM_i²
+        #   τz   = c * Σ s_i F_i        (s_i = fixed spin direction)
+        # MuJoCo applies F_i at each motor site (so roll/pitch torques come
+        # from geometry) and τz via gear[5]. gear_z, c and s_i are read from
+        # the XML so the env always matches what the physics applies.
+        gear = self.model.actuator_gear[self.motor_ids]
+        self.gear_z = np.abs(gear[:, 2])                  # N per ctrl unit   (0.27)
+        self.spin   = np.sign(gear[:, 5])                 # [+1, +1, -1, -1]
+        self.c_yaw  = np.abs(gear[:, 5]) / self.gear_z    # N·m per N         (0.0074)
+        self.ctrl_max = self.model.actuator_ctrlrange[self.motor_ids, 1]
+
+        # RPM band gives F ≈ 0.024–0.078 N per motor: the range in which
+        # differential thrust can steer yaw at every pitch.
+        self.k_thrust = 3.2e-10                           # N / RPM²
+        self.rpm_min  = 8_700.0
+        self.rpm_max  = 15_600.0
+        rpm_ceiling = np.sqrt(self.ctrl_max * self.gear_z / self.k_thrust)
+        assert self.rpm_max <= rpm_ceiling.min(), "rpm_max exceeds XML ctrlrange"
 
         print(f"[DroneEnv] Loaded: {xml_path}")
         print(f"[DroneEnv] sim_steps_per_control = {self.sim_steps_per_control}")
@@ -106,7 +121,7 @@ class DroneEnv(gym.Env):
 
         # Sample a random target
         self.target_yaw   = self.np_random.uniform(0.0, 2 * np.pi)
-        self.target_pitch = self.np_random.uniform(-0.2, 1.2)
+        self.target_pitch = self.np_random.uniform(-0.1, 1.1)
 
         self.steps = 0
 
@@ -125,14 +140,15 @@ class DroneEnv(gym.Env):
         pitch = self.data.qpos[self.pitch_qpos_adr]
         yaw_vel   = self.data.qvel[self.yaw_qvel_adr]
         pitch_vel = self.data.qvel[self.pitch_qvel_adr]
+        rev9_off  = self.data.qpos[self.rev9_qpos_adr] - 4.903
+        rev9_vel  = self.data.qvel[self.rev9_qvel_adr]
 
         err_yaw   = self._angle_wrap(yaw - self.target_yaw)
         err_pitch = pitch - self.target_pitch
 
         return np.array(
-            [yaw, pitch, yaw_vel, pitch_vel,
-             self.target_yaw, self.target_pitch,
-             err_yaw, err_pitch],
+            [err_yaw /np.pi , err_pitch, pitch, self.target_pitch, yaw_vel/ 5.0, pitch_vel/ 5.0,
+             rev9_off, rev9_vel / 5.0],
             dtype=np.float32
         )
 
@@ -148,13 +164,12 @@ class DroneEnv(gym.Env):
         action = np.asarray(action, dtype=np.float32)
         action = np.clip(action, self.action_space.low, self.action_space.high)
 
-        # Apply control to all 4 motors
-        # Remap action [0,1] → [min_ctrl, max_ctrl]
-        ctrl_values = self.min_ctrl + action * (self.max_ctrl - self.min_ctrl)
-        for i, mid in enumerate(self.motor_ids):
-            self.data.ctrl[mid] = ctrl_values[i]
+        # Remap action [-1,1] → RPM [rpm_min, rpm_max] → thrust → ctrl
+        rpm    = self.rpm_min + (action + 1.0) / 2.0 * (self.rpm_max - self.rpm_min)
+        thrust = self.k_thrust * rpm ** 2                 # F_i = k * RPM_i²
+        self.data.ctrl[self.motor_ids] = thrust / self.gear_z
 
-        # Advance MuJoCo simulation (500 steps = 0.1 s of physics)
+        # Advance MuJoCo simulation (200 steps = 0.04 s of physics)
         for _ in range(self.sim_steps_per_control):
             mujoco.mj_step(self.model, self.data)
 
@@ -163,6 +178,8 @@ class DroneEnv(gym.Env):
         obs        = self._get_obs()
         reward     = self._compute_reward(action)
         terminated = self._is_terminated()
+        if terminated:
+            reward -= 10.0
         truncated  = self.steps >= self.max_episode_steps
 
         info = {
@@ -173,6 +190,9 @@ class DroneEnv(gym.Env):
             "target_yaw":   self.target_yaw,
             "target_pitch": self.target_pitch,
             "step":         self.steps,
+            "rpm":          rpm,
+            "thrust":       thrust,
+            "tau_yaw":      float(self.c_yaw[0] * np.sum(self.spin * thrust)),
         }
         return obs, reward, terminated, truncated, info
 
@@ -186,22 +206,22 @@ class DroneEnv(gym.Env):
         err_yaw   = self._angle_wrap(yaw - self.target_yaw)
         err_pitch = pitch - self.target_pitch
 
-        reward = (
-            - 1.0  * err_yaw   ** 2
-            - 1.0  * err_pitch ** 2
-            - 0.01 * float(np.sum(action ** 2))   # energy penalty
-        )
+        yaw_vel = self.data.qvel[self.yaw_qvel_adr]
+
+        # exp term = sharp bonus near target; quadratic term = gradient when far away
+        err_sq = err_yaw ** 2 + err_pitch ** 2
+        reward = np.exp(-err_sq / 0.1) - 0.1 * err_sq - 0.01 * yaw_vel ** 2
         return float(reward)
 
     def _is_terminated(self):
-        pitch   = float(self.data.qpos[self.pitch_qpos_adr])
+        # pitch   = float(self.data.qpos[self.pitch_qpos_adr])
         yaw_vel = float(self.data.qvel[self.yaw_qvel_adr])
         pit_vel = float(self.data.qvel[self.pitch_qvel_adr])
         rev9    = float(self.data.qpos[self.rev9_qpos_adr])
 
         # Joint boundary crash
-        if pitch <= -0.2 or pitch >= 1.2:
-            return True
+        # if pitch <= -0.2 or pitch >= 1.2:
+        #     return True
         # Velocity runaway
         if abs(yaw_vel) > 20.0 or abs(pit_vel) > 20.0:
             return True
