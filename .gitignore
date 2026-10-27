@@ -1,3 +1,7 @@
 # venv
 rl-env
 ltf-env
+__pycache__/
+5DOF.xml
+plan.md
+meshes/
